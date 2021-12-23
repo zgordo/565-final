@@ -1,0 +1,891 @@
+---
+title: "Group 7 Analysis of German Apartments"
+author: "Zach Gordon, Jason Hu, Tyler Dennis"
+date: "12/1/2021"
+output:
+  pdf_document: 
+    latex_engine: xelatex
+  html_document: default
+  word_document: default
+header-echos: \usepackage{setspace}\doublespacing
+---
+
+
+
+```{r setup, include=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+knitr::opts_chunk$set(fig.width=4, fig.height=4) 
+library(glmnet)
+library(GGally)
+library(e1071)
+library(caret)
+library(class)
+library(tidyverse)
+library(ggcorrplot)
+
+```
+
+
+
+
+
+```{r, include=FALSE, warning=FALSE, echo=FALSE, results='hide'}
+data <- read_csv("immo_data.csv")
+```
+
+```{r, echo = FALSE, results='hide', warning=FALSE}
+#price predictor data cleaning
+
+pp_data = data %>% 
+  select(-c(regio1,regio2,regio3, street,streetPlain,baseRent, description, facilities)) %>% 
+  filter(!is.na(totalRent))
+
+nrow(pp_data)
+pp_data %>% head()
+pp_data %>% 
+  
+  summarise_all(funs(sum(!is.na(.))/nrow(pp_data)))
+
+# filter out initial unecessary variables
+pp_comp = pp_data %>% 
+  select(heatingType,telekomTvOffer,newlyConst,balcony,pricetrend,telekomUploadSpeed,totalRent,yearConstructed,firingTypes,hasKitchen,geo_bln,cellar,yearConstructedRange,livingSpace,geo_krs,condition,lift, typeOfFlat,geo_plz,noRooms,floor,condition,date, houseNumber) %>% 
+  drop_na() %>% 
+  mutate(houseNumber = houseNumber %>% as.numeric()) %>% 
+  na.omit()
+
+
+
+data = pp_comp
+
+# create east west divide
+states = data$geo_bln %>%
+  unique()
+
+
+east = c("Brandenburg","Mecklenburg_Vorpommern","Sachsen","Sachsen_Anhalt","Thüringen")
+west = states[!states %in% cbind(east, "Berlin")]
+
+east_plz = c(10439, 13089, 13187, 13189, 10315, 10365, 10367, 13055, 126279,  12681, 12683, 12685, 12687, 12689, 12695, 12559,12435, 10243, 10245, 10247, 10249, 10318, 10319, 10961, 10963, 10965, 10967, 10969, 10997, 10999) # got from wikipedia
+east_plz = unique(east_plz)
+berlin_regions = data %>%
+  filter(geo_bln == "Berlin") %>%
+  select(geo_plz) %>%
+  as.vector() %>%
+  unique()
+west_plz = berlin_regions[!berlin_regions %in% east_plz]
+
+east_vs_west = rep(NA, nrow(data))
+
+east_vs_west = ifelse((data$geo_bln %in% east) | (data$geo_plz %in% east_plz),"east","west")
+
+data = cbind(data, east_vs_west)
+data2 = data %>% na.omit()
+```
+
+
+```{r, echo = FALSE, warning=FALSE}
+set.seed(19)
+east_data = data2 %>% 
+  filter(east_vs_west == "east")
+west_data = data2 %>% 
+  filter(east_vs_west == "west")
+
+east_indices = sample(1:nrow(east_data), 10000)
+west_indices = sample(1:nrow(west_data), 10000)
+
+east_data = east_data[east_indices,]
+west_data = west_data[west_indices,]
+
+data3 = rbind(east_data,west_data)
+d3_indices = sample(1:nrow(data3), 20000)
+data3 = data3[d3_indices,]
+
+zach = data
+jason = data3
+tyler = data3
+```
+
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Zach's extra cleaning
+
+zach = zach %>% 
+  filter(as.numeric(yearConstructed) > 1870,
+         totalRent < 5000,
+         livingSpace < 300) %>% 
+  mutate(heatingType = as.factor(heatingType),
+         telekomTvOffer = as.factor(telekomTvOffer),
+         newlyConst = as.factor(newlyConst),
+         balcony = as.factor(balcony),
+         telekomUploadSpeed = as.factor(telekomUploadSpeed),
+         # yearConstructed = as.factor(yearConstructed),
+         hasKitchen = as.factor(hasKitchen),
+         cellar = as.factor(cellar),
+         condition = as.factor(condition),
+         lift = as.factor(lift),
+         typeOfFlat = as.factor(typeOfFlat),
+         noRooms = as.factor(noRooms),
+         floor = as.factor(floor),
+         east_vs_west = as.factor(east_vs_west)) %>% 
+  select(-c(date, geo_plz,geo_krs,geo_bln, telekomTvOffer, newlyConst, firingTypes))
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Zach's plots
+
+  yearConstructed_ew_plot = zach %>%
+    ggplot(aes(y=yearConstructed, fill = east_vs_west)) +
+    geom_bar() +
+    ggtitle("Year constructed for East and West Germany")
+
+  condition_ew_plot = zach %>%
+    ggplot(aes(y=condition, fill= east_vs_west)) +
+    geom_bar() +
+    ggtitle("Condition of Apartments in East and West Germany")
+
+  data_for_pair = zach %>%
+    select(c(totalRent  , livingSpace, east_vs_west, pricetrend)) %>%
+    filter(totalRent < 100000) %>%
+    mutate(totalRent_log = log(totalRent),
+           livingSpace_log = log(livingSpace  )) %>%
+    select(-c(totalRent,livingSpace))
+
+  ew_pair = ggpairs(data_for_pair, aes(colour = east_vs_west, alpha = .4)) +
+    ggtitle("Pairwise plot of Potentially Important Variables")
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Zach Parameter selection
+set.seed(15)
+cError = vector(length = 10)
+C = seq(.1,10, length.out = 10)
+folds = createFolds(k=10,zach$east_vs_west)
+y = as.vector(folds[2])
+cError = lapply(C, function(x) {
+  training_fold = zach[-y$Fold02,]
+  testing_fold = zach[y$Fold02,]
+  classifier = svm(formula = east_vs_west ~ .,
+                   data = training_fold,
+                   type = "C",
+                   cost = x)
+
+
+
+  pred = predict(classifier, newdata = testing_fold)
+  t = table(pred, testing_fold$east_vs_west)
+  error = (t[1,2] + t[2,1])/nrow(zach)
+  return (error)
+})
+
+
+C = C %>% as.vector(mode = "numeric")
+cError =  cError %>% as.vector(mode = "numeric")
+
+
+C_stuff = tibble(C, cError)
+
+
+C_selection_plot = C_stuff %>%
+  ggplot(aes(x=C, y =cError)) +
+  geom_point() +
+  geom_line() +
+  ylab("Error") +
+  xlab("Cost Parameter") +
+  ggtitle("Comparing different cost paramaters")
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+ # Zach's Cross Validation
+
+
+
+ plots = vector(mode = "list", 10)
+
+ cv = lapply(folds, function(x) {
+ training_fold = zach[-x,]
+  testing_fold = zach[x,]
+ classifier = svm(formula = east_vs_west ~ .,
+                  data = training_fold,
+                   type = "C",
+                   cost = 10)
+
+
+  pred = predict(classifier, newdata = testing_fold)
+  t = table(pred, testing_fold$east_vs_west)
+  error = (t[1,2] + t[2,1])/nrow(testing_fold)
+ return (error)
+ })
+
+ max_svm_error = max(error)
+ min_svm_error = min(error)
+ mena_svm_error = mean(error)
+```
+
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+## Jason cleaning
+
+# pivot unordered categorical variables
+require(data.table)
+dt <- as.data.table(data3)
+types <- unique(data$telekomTvOffer)
+dt <- dt[, lapply(types, function(x) sum(telekomTvOffer==x)), keyby =.(heatingType, newlyConst, balcony, pricetrend, telekomUploadSpeed, totalRent, yearConstructed, firingTypes, hasKitchen, geo_bln, cellar, yearConstructedRange, livingSpace, geo_krs, condition, lift, typeOfFlat, geo_plz, noRooms, floor, date, east_vs_west)]
+dt <- rename(dt, TV_ONE_YEAR_FREE=V1)
+dt <- rename(dt, TV_NONE=V2)
+dt <- rename(dt, TV_ON_DEMAND=V3)
+
+types <- unique(data$heatingType)
+dt <- dt[, lapply(types, function(x) sum(heatingType==x)), keyby =.(newlyConst, balcony, pricetrend, telekomUploadSpeed, totalRent, yearConstructed, firingTypes, hasKitchen, geo_bln, cellar, yearConstructedRange, livingSpace, geo_krs, condition, lift, typeOfFlat, geo_plz, noRooms, floor, date, TV_ONE_YEAR_FREE, TV_NONE, TV_ON_DEMAND, east_vs_west)]
+dt <- rename(dt, HEAT_central_heating=V1)
+dt <- rename(dt, HEAT_oil_heating=V2)
+dt <- rename(dt, HEAT_gas_heating=V3)
+dt <- rename(dt, HEAT_district_heating=V4)
+dt <- rename(dt, HEAT_electric_heating=V5)
+dt <- rename(dt, HEAT_floor_heating=V6)
+dt <- rename(dt, HEAT_self_contained_central_heating=V7)
+dt <- rename(dt, HEAT_combined_heat_and_power_plant=V8)
+dt <- rename(dt, HEAT_night_storage_heater=V9)
+dt <- rename(dt, HEAT_wood_pellet_heating=V10)
+dt <- rename(dt, HEAT_stove_heating=V11)
+dt <- rename(dt, HEAT_heat_pump=V12)
+dt <- rename(dt, HEAT_solar_heating=V13)
+
+dt <- select(dt, -firingTypes)
+
+types <- unique(data$condition)
+dt <- dt[, lapply(types, function(x) sum(condition==x)), keyby =.(newlyConst, balcony, pricetrend, telekomUploadSpeed, totalRent, yearConstructed, hasKitchen, geo_bln, cellar, yearConstructedRange, livingSpace, geo_krs, lift, typeOfFlat, geo_plz, noRooms, floor, date, TV_ONE_YEAR_FREE, TV_NONE, TV_ON_DEMAND, HEAT_central_heating, HEAT_oil_heating, HEAT_gas_heating, HEAT_district_heating, HEAT_electric_heating, HEAT_floor_heating, HEAT_self_contained_central_heating, HEAT_combined_heat_and_power_plant, HEAT_night_storage_heater, HEAT_wood_pellet_heating, HEAT_stove_heating, HEAT_heat_pump, HEAT_solar_heating, east_vs_west)]
+dt <- rename(dt, COND_well_kept=V1)
+dt <- rename(dt, COND_first_time_use_after_refurbishment=V2)
+dt <- rename(dt, COND_first_time_use=V3)
+dt <- rename(dt, COND_refurbished=V4)
+dt <- rename(dt, COND_mint_condition=V5)
+dt <- rename(dt, COND_fully_renovated=V6)
+dt <- rename(dt, COND_modernized=V7)
+dt <- rename(dt, COND_negotiable=V8)
+dt <- rename(dt, COND_need_of_renovation=V9)
+
+types <- unique(data$typeOfFlat)
+dt <- dt[, lapply(types, function(x) sum(typeOfFlat==x)), keyby =.(newlyConst, balcony, pricetrend, telekomUploadSpeed, totalRent, yearConstructed, hasKitchen, geo_bln, cellar, yearConstructedRange, livingSpace, geo_krs, lift, geo_plz, noRooms, floor, date, TV_ONE_YEAR_FREE, TV_NONE, TV_ON_DEMAND, HEAT_central_heating, HEAT_oil_heating, HEAT_gas_heating, HEAT_district_heating, HEAT_electric_heating, HEAT_floor_heating, HEAT_self_contained_central_heating, HEAT_combined_heat_and_power_plant, HEAT_night_storage_heater, HEAT_wood_pellet_heating, HEAT_stove_heating, HEAT_heat_pump, HEAT_solar_heating, COND_well_kept, COND_first_time_use_after_refurbishment, COND_first_time_use, COND_refurbished, COND_mint_condition, COND_fully_renovated, COND_modernized, COND_negotiable, COND_need_of_renovation,  east_vs_west)]
+dt <- rename(dt, TYPE_ground_floor=V1)
+dt <- rename(dt, TYPE_roof_storey=V2)
+dt <- rename(dt, TYPE_apartment=V3)
+dt <- rename(dt, TYPE_other=V4)
+dt <- rename(dt, TYPE_maisonette=V5)
+dt <- rename(dt, TYPE_raised_ground_floor=V6)
+dt <- rename(dt, TYPE_penthouse=V7)
+dt <- rename(dt, TYPE_half_basement=V8)
+dt <- rename(dt, TYPE_terraced_flat=V9)
+dt <- rename(dt, TYPE_loft=V10)
+
+# Removing this because we have no idea what it is
+dt <- select(dt, -yearConstructedRange)
+
+
+pcdata <- select(dt, -geo_bln, -geo_krs, -geo_plz, -TV_ONE_YEAR_FREE, -TV_NONE, -TV_ON_DEMAND)
+pcdata <- pcdata %>% select(east_vs_west, everything())
+pcdata <- pcdata %>% select(date, everything())
+pcdata <- pcdata %>% filter(as.numeric(yearConstructed) > 1870,
+totalRent < 5000,
+totalRent > 100,
+livingSpace < 300,
+noRooms < 40,
+livingSpace > 5)
+
+pcdata <- pcdata[order(pcdata$date),]
+
+pcdata %>% count(date)
+pcdata %>% count(east_vs_west)
+
+colSums(Filter(is.numeric, pcdata))
+
+# Making PCS
+pcs = prcomp(pcdata[,3:46], scale=TRUE)
+```
+
+```{r, echo = FALSE}
+# Jason model
+
+
+md1 <- lm (totalRent~date, data=pcdata)
+md1sum <- summary(md1)
+
+
+```
+
+
+
+```{r, echo = FALSE}
+# Jason's plots
+
+graph <- group_by(pcdata, date) %>% summarise_at(vars(totalRent), list(name = mean))
+
+graph <- graph[c(1,2,4,3),]
+x <- factor( graph$date, levels = c("Feb20", "May19", "Sep18", "Oct19") )
+graph$date <- x
+
+priceplot <- ggplot(data=graph, aes(date, name)) + ggtitle("Average Rent by Month") + geom_point() + xlab("Month") + ylab("Average Total Rent") + theme(plot.title = element_text(size=20, face="bold", 
+    margin = margin(10, 0, 10, 0))) + theme_minimal()
+
+# Cumulative variance plot
+var_explained_df <- data.frame(PC= paste0("PC",1:60),
+                               var_explained=(pcs$sdev^2 / sum(pcs$sdev^2))[1:60])
+
+
+var_explained_df$PC <- factor(var_explained_df$PC, levels = var_explained_df$PC)
+var <- var_explained_df %>%
+  ggplot(aes(x=PC,y=var_explained, group=1))+
+  geom_point(size=2)+
+  geom_line()+
+  labs(title="Scree plot: PCA on scaled data") + theme(axis.text.x=element_text(angle=-90,hjust=1))
+
+
+cum_var_explained_df <- data.frame(PC= paste0("PC",1:60),
+                               cum_var_explained=cumsum(pcs$sdev^2 / sum(pcs$sdev^2))[1:60])
+
+cum_var_explained_df$PC <- factor(cum_var_explained_df$PC, levels = cum_var_explained_df$PC)
+cum_var <- cum_var_explained_df %>%
+  ggplot(aes(x=PC,y=cum_var_explained, group=1))+
+  geom_point(size=2)+
+  geom_line()+
+  labs(title="Screen plot: PCA on scaled data") + theme(axis.text.x=element_text(angle=-90,hjust=1))
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# Introduction
+
+|   This report covers our findings on German rent data throughout the span of February to October 2020. It goes into detail about the small effect COVID-19 had on prices, as well as the creation of models to predict rent rates based on apartment attributes. It also echos a classification method that aims to determine whether the apartment is located in East or West Germany. 
+|   The dataset we chose consisted of 268,850 observations of apartment attributes throughout Germany which were scraped at four separate times: February, May, September, and October of 2020. The attributes consisted of the total monthly rent of the apartment, as well as accommodations such as having a kitchen, balcony, etc. It also echod apartment qualities like number of rooms, which floor it is located on, and amount of living space. 
+|   The first research question we had came from the date at which the data was scraped, which was pre-COVID/during the beginning of the COVID pandemic. We wanted to know if apartment rent in Germany was affected in any way by the outbreak of the virus, similar to how rent rates in the United States were affected. Our second question involved the prediction of rent prices based on attribute data. We knew that there was a strong relation between apartment attributes and rent price, but wanted to find the most significant variables, as well as know if that relationship was linear, or logistic, or another form. Our third question came from our curiosity about the lasting effects of World War II and the Soviet Division of Germany. Was there a significant difference between the development of living spaces in old Soviet Germany and not Soviet Germany? To answer this we wanted to see if German apartments were able to be correctly classified into East or West locations based on their attributes.
+
+
+# Data Overview
+
+|   The data set consists of rental apartment listings throughout Germany. The creators of the data set scraped it from https://www.immobilienscout24.de/, which is similar to Zillow. We retrieved the data from Kaggle. The original data set had 268,850 observations and 49 variables, which describe the apartments. Notable variables echo tota rent, living space, location, and when the apartment was constructed. 
+We found this data set interesting for a few reasons. The first was that the data was scraped at the beginning of the COVID-19 pandemic. This means the rents for the apartments could have been influenced by the pandemic. The second reason we found it interesting was the possibility of using the variables to build a rent prediction model. Variables like living space and number of rooms correlates with rent which means it could be possible to get a well fitting regression model to predict rent. The last reason we were interested in the data set was that it was from Germany. Until the early 1990’s Germany was divided into two separate countries, East Germany and West Germany. East Germany was under the influence of the Soviet Union and West Germany was under the influence of NATO. The two countries had very different housing policies. As a result their housing stock looked quite different. This means we could  identify if an apartment was located in East Germany or West Germany based on the variables in the data set.  
+
+|   The data contained a very high number of NA values. We used this to inform our variable selection. We looked at the percentage of values that were not NA for each variable and eliminated all variables with over 40 percent missing. We then used the na.omit() function to remove the remaining observations with missing values. This left us with 79,867 observations, which is approximately 35 percent of the original data.
+To prepare the data for use in our models, we also eliminated variables that were uninterpretable. These variables echod “description”, “facilities”, and “streetName” which were long strings of German text.  We checked variables that seemed irrelevant, like “houseNumber” for correlation with price, then eliminated them if they were not high enough. “firingType” proved to be too unwieldy a format to use, so we eliminated it.
+We decided to pivot all of our unordered categorical variables so that each value of a categorical variable now had a new indicator column. The column corresponding to the value that sample was would have a “1” as its value while other indicator columns would have a “0”. This would allow us to more accurately represent unordered categorical variables in our models, as well as allow us to use them in PCA.
+|   The data was then filtered to exclude enormous outlier variables, for example, an observation having a total rent above 50,000 while the second highest was 5 times less than i. The filters we applied were: Year Constructed after 1830, Total rent less than 5000 and greater than 100, Living Space under 300 square meters and greater than 5 square meters, and Number Of Rooms less than 40.
+|   The last step of pre-processing was to create a new variable called “east_vs_west”. This new variable was built by categorizing all Western states as “west”, and all eastern states as “east”. Berlin was dealt with by dividing the city based on zip codes. The Wikipedia page for German zip codes was consulted for this. We then subsetted the data and took 20,000 random observations from these 79,000. We made sure half of them were from East Germany and half were from West Germany.
+
+
+# Exploratory Data Analysis
+
+|   For the purpose of the rent prediction model, we explored which numerical predictors correlated with rent. We found that the number of rooms, the price trend, and the living space in square meters were all strongly correlated with the price of rent.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+dt_cp <- data3 %>% dplyr::select(c(totalRent, yearConstructed, livingSpace, pricetrend, noRooms))
+cp_matrix <- round(cor(dt_cp),2)
+ggcorrplot(cp_matrix, method = "square", title = "CorrPlot of Total Rent with Numerical Predictors", hc.order = TRUE)
+```
+	
+|   In terms of categorical variables, we wanted to see if the presence of certain features had statistically significant effects on rent prices. We found that the differences in the price of rent were not statistically significant for the presence of cellars, elevators, and kitchens. However, newly-constructed properties did have a statistically significant increase in the price of rent.
+
+
+|   We did a scaled PCA analysis of our numerical data and plotted the variance explained and cumulative variance of each PC. Scaled analysis was better due to the difference in magnitudes of many variables.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+var
+cum_var
+```
+
+
+|   The variance explained by the PCs do not look out of the ordinary (PC1 does not explain an unexpectedly high amount of variance), although the variance explained by the first few PCs are a little low, which could mean there is a smaller chance of finding significant findings.
+|   We then plotted a biplot of PC1 and PC2 along with factor loadings of variables:
+	
+```{r, echo=FALSE, results='hide', warning=FALSE}
+#biplot
+loadings <- pcs$rotation
+scores <- pcs$x
+biplot(scores[4000:8000, 1:2], loadings[1:12, 1:2], cex=0.7)
+```
+
+|   The black numbers represent samples and are plotted on the graph based on their PC1 and PC2 scores. The red arrows represent the first 13 variables, which are plotted based on their factor loadings (correlation) with PC1 and PC2. The arrows point in the direction that a point will be moved if that observation increases its value for that variable. The red arrows can also be interpreted as showing how much correlation variables have with each other. If two variables have red arrows pointing the same direction that means they are correlated the same with PC1 and PC2, which means that they are also likely correlated with each other. From this the biplot suggests that livingSpace, noRooms, pricetrend, and hasKitchen all seem to have a rather strong correlation with totalRent, the variable we will be predicting with our models.
+|   The east-west classification question required extra exploratory analysis. We compared key variables for both the east and west labels. The first plot we made looked at was a pair plot which compared “pricetrend”, “totalRent”, and “livingSpace”. “totalRent” and “livingSpace” were logged to make it easier to see the trends. “Pricetrend” showed the largest separation between east and west. totalRent and “livingSpace” had some separations but less than “pricetrend”. One explanation for this is that more people want to live in the west than in the east which leads to increasing prices. As shown in other analyses there is a correlation between “livingSpace” and “totalRent”. Both “totalRent” and “livingSpace” follow a normal distribution in the east and the west. The next two variables we checked were the year constructed and the condition of the apartment. Based on the graph of “yearConstructed” there appears to be clusters of years with a higher proportion of east labels than others. However, it is not the case that as the year increases the ratio of east to west increases or decreases. This means there does not appear to be a linear relationship between location and yearConstructed. The analysis of the condition of the apartments revealed that “well_kept” and “refurbished” had the highest ratio of east to west labels, with “refurbished” being the only label with a majority in the east. This is an indicator of separation and shows promise for the classification model.  
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+ew_pair
+yearConstructed_ew_plot
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE, fig.width=8}
+
+condition_ew_plot
+```
+
+
+
+
+
+
+# Learning Methods
+
+|   We chose a variety of methods to answer the research questions. Principal Component Analysis and ordinary least squares regression were used to examine the effect COVID had on rental prices. The rental price predictor was built using Ridge and LASSO regression. A support was the method used to classify apartments as being in either the east or the west. Both the rent predictor and the classifier took advantage of cross validation to protect against overfitting.
+	
+## PCA
+
+|   Principal Component Analysis is mainly used as a dimension-reductionality tool during exploratory data analysis. After reducing the dimensionality of the data, we can use the principal components of the data to explore relationships between variables as well as the clustering of observations. PCA reduces dimensionality by finding  a line in the data that results in the greatest variation when all observations are projected onto that line. This line, called the first principal component, becomes a new “axis” that allows us to see the largest chunk of variability in data possible by looking at only one dimension. There is then a new “axis” created for every variable that is orthogonal to every other line, each sequenced line explaining less and less variability in the data. After the principal components are made, we can plot samples based on PC values and look at those graphs to find clusters in data. We can also look at factor loadings for each variable to each principal component, which shows the correlation between that variable and that principal component. If two variables are both positively correlated to the same principal component, then it is likely that those two variables are also correlated. For relating samples to variable factor loadings, if an observation increases in the value of a variable, and that variable has a positive factor loading on a principal component, then that observation has an increased PC value for the respective PC. For our research we mainly used PCA as a clustering analysis tool, specifically for our research on East and West divide, as well as on COVID affecting rent price.
+	
+## OLS
+
+|   Ordinary Least Squares regression is the simplest of linear regression models, which aims to find the one-dimensional line in data that will result in the minimum of the sum of all squared distances of observation points from that line. It is used to model linear regression and predict a response variable by predictor variables, assuming they have a linear relationship. This method is used in our research on COVID affecting rent price, specifically, to see if there is a linear relationship between date and total rent, and if there is, to show the degree to which COVID affected rent.
+
+## Cross-Validation
+
+|   K-Folds Cross-Validation is a method of cross-validation which shuffles the data and splits it into k folds. This is performed by reserving one fold as the testing set and using the other k-1 groups as training sets for fitting a model. This is then repeated k times, with each fold serving as the test data once and all the Cross-Validated Errors are averaged. As the value of k increases, bias decreases and variance increases. This method prevents overfitting and sample bias.
+
+## Ridge Regression
+
+|   Ridge Regression is a method of linear regression that adds a penalty term that is equal to the square of the coefficient of each predictor. There is also a coefficient added to the penalty term that penalizes large predictor coefficients. If the penalty term is zero, then the method as OLS. As we increase the value of the penalty term, it causes the value of the coefficient to trend towards zero. This leads to lower variance and low training bias.
+
+## LASSO Regression
+
+|  LASSO Regression, short for Least Absolute Shrinkage and Selection Operator Regression, is a linear regression model that, in a similar fashion to Ridge Regression, adds a penalty term and a regularization . It adds a penalty term to the cost function. This term is the sum of the absolute value of the coefficients. As the value of coefficients increases from 0 this term increases, causing the model to decrease the value of coefficients in order to reduce loss. As opposed to Ridge Regression, which lowers the value of coefficients but won’t reduce dimensionality, LASSO Regression tends to set coefficients equal to zero.
+
+## SVM
+
+|   The new supervised learning method we chose was a support vector machine or SVM. SVM is  a non-stochastic learning method that uses the shape of the data to create a binary classification. It uses a hyperplane to divide the data and create a decision boundary. It chooses the hyperplane by maximizing the minimum distance of the observations to the hyperplane. The observations with the minimum distance to the hyperplane are referred to as support vectors. If the data is linearly separable then the optimization problem is solvable as is and a decision boundary is found that perfectly divides the data. If the data is not linearly separable then slack variables are added to some of the variables in order to make the problem solvable. This is called soft margin and it allows for misclassifications in the data. Because the data is almost never linearly separable, including our data, soft margin is frequently implemented. There is also a method called the “kernal trick” which adds dimensionality to make the data linearly separable, or at least more linearly separable. The “kernel trick” brings the risk of overfitting if too complex. Under soft margin SVM uses a hyper parameter called degree of tolerance or C. The point of this parameter is to penalize the model for misclassifications. The higher the parameter the higher the penalty for misclassification. Too high of a parameter can lead to overfitting. We use SVM to classify apartments as being either in East Germany or West Germany. Our model uses a soft max approach and tests multiple C values to find the optimal parameter. We also implement a 10-fold cross validation to check for overfitting.
+ 
+	
+# Results and Discussion
+## Effects of the Covid-19 Pandemic on Rent Pices
+|   With our PCA described in the Exploratory Data Analysis section, we plotted pairwise plots of observations based on their PC1, PC2, and PC3 scores. We then color-coded observations by the month they were scraped in to see if any apparent clusters appeared.
+```{r, echo = FALSE}
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 1], scores[, 2], xlab='PCA 1', ylab='PCA 2', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 1], scores[Feb, 2], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 1], scores[May, 2], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 1], scores[Sep, 2], pch=16, cex=0.7, col='orange')
+
+points(scores[Oct, 1], scores[Oct, 2], pch=16, cex=0.7, col='red')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='orange')
+text(-9, 5, 'Oct', col='red')
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 1], scores[, 3], xlab='PCA 1', ylab='PCA 3', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 1], scores[Feb, 3], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 1], scores[May, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 1], scores[Sep, 3], pch=16, cex=0.7, col='orange')
+
+points(scores[Oct, 1], scores[Oct, 3], pch=16, cex=0.7, col='red')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='orange')
+text(-9, 5, 'Oct', col='red')
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 2], scores[, 3], xlab='PCA 2', ylab='PCA 3', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 2], scores[Feb, 3], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 2], scores[May, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 2], scores[Sep, 3], pch=16, cex=0.7, col='orange')
+
+points(scores[Oct, 2], scores[Oct, 3], pch=16, cex=0.7, col='red')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='orange')
+text(-9, 5, 'Oct', col='red')
+```
+
+
+|   From this, there seems to be no apparent clusters formed when coloring by the four different dates. We then decided to color-code by months before the COVID pandemic and months after to see if there was any clustering.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# Clustering with february dif
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 1], scores[, 2], xlab='PCA 1', ylab='PCA 2', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 1], scores[Feb, 2], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 1], scores[May, 2], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 1], scores[Sep, 2], pch=16, cex=0.7, col='green')
+
+points(scores[Oct, 1], scores[Oct, 2], pch=16, cex=0.7, col='green')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='green')
+text(-9, 5, 'Oct', col='green')
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 1], scores[, 3], xlab='PCA 1', ylab='PCA 3', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 1], scores[Feb, 3], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 1], scores[May, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 1], scores[Sep, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Oct, 1], scores[Oct, 3], pch=16, cex=0.7, col='green')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='green')
+text(-9, 5, 'Oct', col='green')
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+dev.new(height=7, width=7)
+Feb <- pcdata$date == "Feb20"
+May <- pcdata$date == "May19"
+Sep <- pcdata$date == "Sep18"
+Oct <- pcdata$date == "Oct19"
+
+plot(scores[, 2], scores[, 3], xlab='PCA 2', ylab='PCA 3', type='n', asp=1, las=1)
+
+
+
+ 
+points(scores[Feb, 2], scores[Feb, 3], pch=16, cex=0.7, col='blue')
+ 
+points(scores[May, 2], scores[May, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Sep, 2], scores[Sep, 3], pch=16, cex=0.7, col='green')
+
+points(scores[Oct, 2], scores[Oct, 3], pch=16, cex=0.7, col='green')
+
+ 
+text(12, 5, 'Feb', col='blue')
+text(-9, -6, 'May', col='green')
+text(8, -6, 'Sep', col='green')
+text(-9, 5, 'Oct', col='green')
+```
+
+
+|   It seems from this too that there are not any apparent clusters.
+We then moved on to OLS regression to see if we could find a linear trend in total rent price based on date.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+md1sum
+```
+
+|   The output of the OLS regression shows that rent was not very significantly affected by changes in date, although some dates did change more than others. This also implied that a linear model was probably not the ideal method for looking at price changes. Although this regression did show us that there was a trend in the data, with rent going down in May, but then increasing again to be even higher than pre-COVID in October.
+	From this we decided to look at a visual representation of average prices during specific months.
+```{r, echo=FALSE, results='hide', warning=FALSE}
+priceplot
+```
+
+|   From this we clearly see a trend in the short time period between February and October, with it seemingly looking quadratic. The average rent price dropped 1.62% in May, then increased by 1.09% in September, then increased by 2.82% in October.
+|   So based on the data, rent price dropped at the beginning of COVID, then increased and spiked up in October as COVID went on. There are many ways to interpret this. One way is to infer that COVID did play a hand in these price changes. At the beginning of the pandemic people could have been less likely to be out looking for apartments, so rent price would drop, but lower interest rates and low prices could have caused a surplus of buying after the initial drop in price. This would be parallel to what happened in the United States, where lower interest rates on living spaces caused a large surplus of houses sold, causing price increases during COVID. However, it is also possible that these price changes are not caused by COVID. For example, landlords could want to rent out their apartments during the summer, a time when many people are looking for a new place, so they would lower their prices. Then, as more people rented apartments and/or the sale season ended, prices went back up.
+
+
+
+## Rent Prediction Models
+```{r, echo=FALSE, results='hide', warning=FALSE}
+# dtr <- data3 %>% dplyr::select(-c(totalRent, geo_bln, geo_krs, date)) %>%
+#   mutate(geo_plz = as.factor(geo_plz))
+# dtr <- model.matrix(~.-1, dtr)
+# ```
+# ```{r, echo=FALSE, results='hide', warning=FALSE}
+# train55 = 10000
+# test55 <- length(data3) - train55
+# training_dtr55 <- dtr[1:train55,]
+# testing_dtr55 <- dtr[(train55 + 1):20000,]
+# 
+# train64 = 12000
+# test64 <- length(data3) - train64
+# training_dtr64 <- dtr[1:train64,]
+# testing_dtr64 <- dtr[(train64 + 1):20000,]
+# 
+# train73 = 14000
+# test73 <- length(data3) - train73
+# training_dtr73 <- dtr[1:train73,]
+# testing_dtr73 <- dtr[(train73 + 1):20000,]
+# 
+# train82 = 16000
+# test82 <- length(data3) - train82
+# training_dtr82 <- dtr[1:train82,]
+# testing_dtr82 <- dtr[(train82 + 1):20000,]
+# 
+# train91 = 18000
+# test91 <- length(data3) - train91
+# training_dtr91 <- dtr[1:train91,]
+# testing_dtr91 <- dtr[(train91 + 1):20000,]
+# ```
+# ```{r, echo=FALSE, results='hide', warning=FALSE}
+# lambda_rr55 <- cv.glmnet(x= as.matrix(training_dtr55), y= data3$totalRent[1:train55])$lambda.min
+# rr55<- cv.glmnet(x = as.matrix(training_dtr55), y = data3$totalRent[1:train55], alpha = 0, lambda = lambda_rr55, nfolds = 10)
+# 
+# lambda_rr64 <- cv.glmnet(x= as.matrix(training_dtr64), y= data3$totalRent[1:train64])$lambda.min
+# rr64<- glmnet(x = as.matrix(training_dtr64), y = data3$totalRent[1:train64], alpha = 0, lambda = lambda_rr64)
+# 
+# lambda_rr73 <- cv.glmnet(x= as.matrix(training_dtr73), y= data3$totalRent[1:train73])$lambda.min
+# rr73<- glmnet(x = as.matrix(training_dtr73), y = data3$totalRent[1:train73], alpha = 0, lambda = lambda_rr73)
+# 
+# lambda_rr82 <- cv.glmnet(x= as.matrix(training_dtr82), y= data3$totalRent[1:train82])$lambda.min
+# rr82<- glmnet(x = as.matrix(training_dtr82), y = data3$totalRent[1:train82], alpha = 0, lambda = lambda_rr82)
+# 
+# lambda_rr91 <- cv.glmnet(x= as.matrix(training_dtr91), y= data3$totalRent[1:train91])$lambda.min
+# rr91<- glmnet(x = as.matrix(training_dtr91), y = data3$totalRent[1:train91], alpha = 0, lambda = lambda_rr91)
+# ```
+# ```{r, echo=FALSE, results='hide', warning=FALSE}
+# lambda_lasso55 <- cv.glmnet(x= as.matrix(training_dtr55), y= data3$totalRent[1:train55], alpha = 1)$lambda.min
+# lasso55<- glmnet(x = as.matrix(training_dtr55), y = data3$totalRent[1:train55], alpha = 1, lambda = lambda_lasso55)
+# 
+# lambda_lasso64 <- cv.glmnet(x= as.matrix(training_dtr64), y= data3$totalRent[1:train64], alpha = 1)$lambda.min
+# lasso64<- glmnet(x = as.matrix(training_dtr64), y = data3$totalRent[1:train64], alpha = 1, lambda = lambda_lasso64)
+# 
+# lambda_lasso73 <- cv.glmnet(x= as.matrix(training_dtr73), y= data3$totalRent[1:train73], alpha = 1)$lambda.min
+# lasso73<- glmnet(x = as.matrix(training_dtr73), y = data3$totalRent[1:train73], alpha = 1, lambda = lambda_lasso73)
+# 
+# lambda_lasso82 <- cv.glmnet(x= as.matrix(training_dtr82), y= data3$totalRent[1:train82], alpha = 1)$lambda.min
+# lasso82<- glmnet(x = as.matrix(training_dtr82), y = data3$totalRent[1:train82], alpha = 1, lambda = lambda_lasso82)
+# 
+# lambda_lasso91 <- cv.glmnet(x= as.matrix(training_dtr91), y= data3$totalRent[1:train91], alpha = 1)$lambda.min
+# lasso91<- glmnet(x = as.matrix(training_dtr91), y = data3$totalRent[1:train91], alpha = 1, lambda = lambda_lasso91)
+```
+
+|   To make rent prediction models, we used both Ridge and LASSO Regression on the training sets. To explore the effects of the relative sizes of training sets and testing sets, we divided the n = 20,000 observations into five different sets of training and testing data divided as follows: 50-50, 60-40, 70-30, 80-20, and 90-10. The cv.glmnet function was used to find the value of lambda that minimized the Mean Cross-Validated Error for each training set and then the glmnet function was used to fit the data.The optimal values of 𝜆 were found to be 0.4021 and 0.3664 for Ridge and LASSO Regression, respectively. The 𝜆 optimization for both is visualized below.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+rr_opt <- cv.glmnet(x= as.matrix(training_dtr82), y= data3$totalRent[1:train82])
+rr_opt_lambdas <- rr_opt$lambda
+rr_opt_cvm <- rr_opt$cvm
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE, warning=FALSE}
+rr_cvm <- data.frame(cbind(rr_opt_lambdas, rr_opt_cvm))
+ggplot() +
+  geom_line(data = rr_cvm, mapping  = aes(x = rr_opt_lambdas, y = rr_opt_cvm)) +
+  xlim(c(0,5)) + ylim(c(0,50000)) +
+  xlab("Lambda Values") + ylab("Mean Cross-Validated Error") + ggtitle("Lambda Optimization of 80-20 Ridge Regression Model")
+```
+```{r, echo=FALSE, results='hide', warning=FALSE, warning=FALSE}
+lasso_cvm <- data.frame(cbind(lasso_opt_lambdas, lasso_opt_cvm))
+ggplot() +
+  geom_line(data = lasso_cvm, mapping  = aes(x = lasso_opt_lambdas, y = lasso_opt_cvm)) +
+  xlim(c(0,5)) + ylim(c(0,50000)) +
+  xlab("Lambda Values") + ylab("Mean Cross-Validated Error") + ggtitle("Lambda Optimization of 80-20 LASSO Regression Model")
+```
+```{r, echo=FALSE, results='hide', warning=FALSE}
+rr_splits <- c("50-50", "60-40", "70-30", "80-20", "90-10")
+rr_nrmse_train <- c(rr55_nrmse_train, rr64_nrmse_train, rr73_nrmse_train, rr82_nrmse_train, rr91_nrmse_train)
+rr_nrmse_test <- c(rr55_nrmse_test, rr64_nrmse_test, rr73_nrmse_test, rr82_nrmse_test, rr91_nrmse_test)
+rr_rmse_train <- c(rr55_rmse_train, rr64_rmse_train, rr73_rmse_train, rr82_rmse_train, rr91_rmse_train)
+rr_rmse_test <- c(rr55_rmse_test, rr64_rmse_test, rr73_rmse_test, rr82_rmse_test, rr91_rmse_test)
+rr_nrmse <- data.frame(cbind(rr_splits, as.vector(rr_nrmse_train), as.vector(rr_nrmse_test), as.vector(rr_rmse_train), as.vector(rr_rmse_test)))
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+lambda_lasso55 <- cv.glmnet(x= as.matrix(training_dtr55), y= data3$totalRent[1:train55], alpha = 1)$lambda.min
+lasso55<- glmnet(x = as.matrix(training_dtr55), y = data3$totalRent[1:train55], alpha = 1, lambda = lambda_lasso55)
+
+lambda_lasso64 <- cv.glmnet(x= as.matrix(training_dtr64), y= data3$totalRent[1:train64], alpha = 1)$lambda.min
+lasso64<- glmnet(x = as.matrix(training_dtr64), y = data3$totalRent[1:train64], alpha = 1, lambda = lambda_lasso64)
+
+lambda_lasso73 <- cv.glmnet(x= as.matrix(training_dtr73), y= data3$totalRent[1:train73], alpha = 1)$lambda.min
+lasso73<- glmnet(x = as.matrix(training_dtr73), y = data3$totalRent[1:train73], alpha = 1, lambda = lambda_lasso73)
+
+lambda_lasso82 <- cv.glmnet(x= as.matrix(training_dtr82), y= data3$totalRent[1:train82], alpha = 1)$lambda.min
+lasso82<- glmnet(x = as.matrix(training_dtr82), y = data3$totalRent[1:train82], alpha = 1, lambda = lambda_lasso82)
+
+lambda_lasso91 <- cv.glmnet(x= as.matrix(training_dtr91), y= data3$totalRent[1:train91], alpha = 1)$lambda.min
+lasso91<- glmnet(x = as.matrix(training_dtr91), y = data3$totalRent[1:train91], alpha = 1, lambda = lambda_lasso91)
+```
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+lasso55_train <- predict.glmnet(lasso55, newx = training_dtr55)
+lasso55_test <- predict.glmnet(lasso55, newx = testing_dtr55)
+
+lasso55_mse_train <- mean((lasso55_train - data3$totalRent[1:train55])^2)
+lasso55_mse_test <- mean((lasso55_test - data3$totalRent[(train55 + 1):20000])^2)
+
+lasso55_rmse_train <- sqrt(lasso55_mse_train)
+lasso55_rmse_test <- sqrt(lasso55_mse_test)
+
+lasso55_nrmse_train <- lasso55_rmse_train / mean(data3$totalRent[1:train55])
+lasso55_nrmse_test <- lasso55_rmse_test / mean(data3$totalRent[(train55 + 1):20000])
+
+lasso64_train <- predict.glmnet(lasso64, newx = training_dtr64)
+lasso64_test <- predict.glmnet(lasso64, newx = testing_dtr64)
+
+lasso64_mse_train <- mean((lasso64_train - data3$totalRent[1:train64])^2)
+lasso64_mse_test <- mean((lasso64_test - data3$totalRent[(train64 + 1):20000])^2)
+
+lasso64_rmse_train <- sqrt(lasso64_mse_train)
+lasso64_rmse_test <- sqrt(lasso64_mse_test)
+
+lasso64_nrmse_train <- lasso64_rmse_train / mean(data3$totalRent[1:train64])
+lasso64_nrmse_test <- lasso64_rmse_test / mean(data3$totalRent[(train64 + 1):20000])
+
+lasso73_train <- predict.glmnet(lasso73, newx = training_dtr73)
+lasso73_test <- predict.glmnet(lasso73, newx = testing_dtr73)
+
+lasso73_mse_train <- mean((lasso73_train - data3$totalRent[1:train73])^2)
+lasso73_mse_test <- mean((lasso73_test - data3$totalRent[(train73 + 1):20000])^2)
+
+lasso73_rmse_train <- sqrt(lasso73_mse_train)
+lasso73_rmse_test <- sqrt(lasso73_mse_test)
+
+lasso73_nrmse_train <- lasso73_rmse_train / mean(data3$totalRent[1:train73])
+lasso73_nrmse_test <- lasso73_rmse_test / mean(data3$totalRent[(train73 + 1):20000])
+
+lasso82_train <- predict.glmnet(lasso82, newx = training_dtr82)
+lasso82_test <- predict.glmnet(lasso82, newx = testing_dtr82)
+
+lasso82_mse_train <- mean((lasso82_train - data3$totalRent[1:train82])^2)
+lasso82_mse_test <- mean((lasso82_test - data3$totalRent[(train82 + 1):20000])^2)
+
+lasso82_rmse_train <- sqrt(lasso82_mse_train)
+lasso82_rmse_test <- sqrt(lasso82_mse_test)
+
+lasso82_nrmse_train <- lasso82_rmse_train / mean(data3$totalRent[1:train82])
+lasso82_nrmse_test <- lasso82_rmse_test / mean(data3$totalRent[(train82 + 1):20000])
+
+lasso91_train <- predict.glmnet(rr91, newx = training_dtr91)
+lasso91_test <- predict.glmnet(rr91, newx = testing_dtr91)
+
+lasso91_mse_train <- mean((lasso91_train - data3$totalRent[1:train91])^2)
+lasso91_mse_test <- mean((lasso91_test - data3$totalRent[(train91 + 1):20000])^2)
+
+lasso91_rmse_train <- sqrt(lasso91_mse_train)
+lasso91_rmse_test <- sqrt(lasso91_mse_test)
+
+lasso91_nrmse_train <- lasso91_rmse_train / mean(data3$totalRent[1:train91])
+lasso91_nrmse_test <- lasso91_rmse_test / mean(data3$totalRent[(train91 + 1):20000])
+```
+```{r, echo=FALSE, results='hide', warning=FALSE}
+lasso_splits <- c("50-50", "60-40", "70-30", "80-20", "90-10")
+lasso_nrmse_train <- c(lasso55_nrmse_train, lasso64_nrmse_train, lasso73_nrmse_train, lasso82_nrmse_train, lasso91_nrmse_train)
+lasso_nrmse_test <- c(lasso55_nrmse_test, lasso64_nrmse_test, lasso73_nrmse_test, lasso82_nrmse_test, lasso91_nrmse_test)
+lasso_rmse_train <- c(lasso55_rmse_train, lasso64_rmse_train, lasso73_rmse_train, lasso82_rmse_train, lasso91_rmse_train)
+lasso_rmse_test <- c(lasso55_rmse_test, lasso64_rmse_test, lasso73_rmse_test, lasso82_rmse_test, lasso91_rmse_test)
+
+lasso_nrmse <- data.frame(cbind(lasso_splits, as.vector(lasso_nrmse_train), as.vector(lasso_nrmse_test), as.vector(lasso_rmse_train), as.vector(lasso_rmse_test)))
+
+```
+
+|   To measure the predictive power of the ten models, we used the Normalized Root of the Mean Square Error (NRMSE), which was calculated by taking the root of the Norrmalized SSE, in which each observations squared error is divided by the value of the observation. Tables showing the error of each ratio are provided below for Ridge and LASSO Regression, respectively.
+
+```{r, echo=FALSE, results='hide', warning=FALSE}
+colnames(rr_nrmse) = c("Data Split", "Training NRMSE", "Testing NRMSE", "Training RMSE", "Testing RMSE")
+colnames(lasso_nrmse) = c("Data Split", "Training NRMSE", "Testing NRMSE", "Training RMSE", "Testing RMSE")
+
+rr_nrmse
+lasso_nrmse
+```
+
+```{r  echo=FALSE, fig.cap="Ridge", out.width = '100%'}
+knitr::include_graphics("ridge.png")
+```
+
+```{r  echo=FALSE, fig.cap="LASSO", out.width = '100%'}
+knitr::include_graphics("lasso.png")
+```
+	
+|   As can be seen, the 80-20 training and testing set ratio provided the lowest NRMSE on the testing sets for both regression methods. Unfortunately, the best model for Ridge Regression had an NRMSE of 25.34% and the best model for LASSO Regression had one of 25.05%. A rent prediction model with 25% error indicate a weak predictive power.
+
+## East or West German Classification
+
+|	The results of the east-west classifier were relatively strong given the nature of the problem and the quality of the data. The first step in the process was to find an optimal C parameter; this was done by training models using different parameters and choosing the parameter that produced the lowest error. While doing this we used a training sample size of 18,000 and a testing sample size of 2,000. We tested 10 C values in a range from .0001 to 10. The chart shows the change in error for each parameter. The highest C was at point .0001 with an error of 15 percent. The lowest was between 3.4 and 5.6 with an error of 9 percent. Based on this graph we chose a C parameter of 4.75, which is the middle point of the lowest Cs.
+	
+```{r, echo=FALSE, results='hide', warning=FALSE}
+#C_selection_plot
+```
+
+|	The next step in the process was to run the 10-fold cross validation. The point of this was to use as much of the data for training as possible without overfitting. The training folds contained 18,000 data points and the testing folds contained 2,000 data points. The maximum error produced by the cross-validation was 16.25 percent, the minimum error was 13.4 percent, and the mean error was 14.42 percent. This is noticeably higher than when finding the optimal C value which is intriguing and may be due to being a different split. 
+	
+```{r echo=FALSE, out.width='100%'}
+knitr::include_graphics('C_image.png')
+```
+
+# Conclusion
+
+
+|  In Regards to COVID affecting rent prices, we came to the conclusion that the effect of COVID on rent price in Germany in 2020 was negligible. The largest change in price was only 2.82% in between September and October. This is also assuming that COVID was the cause of these price changes, it is possible that other factors are in play that changed the price, such as summertime being a hotspot for apartment sales. For seeing if COVID affected rent price, it would be beneficial if we had another set of data from years before COVID that we could compare results from this data to, to see if the trends are the same or different, implying whether or not COVID really was a factor in this trend.
+|	Using Ridge and LASSO Regression methods, we were unable to make a strong rent prediction model. The ratio between training and testing data that minimized the NRMSE on the testing set was the 80-20 split for both models. A future attempt could be made with other regression methods, both linear and nonlinear. Additional features from another dataset regarding the localities in which the rental properties are located could supplement this data to make a stronger model.
+|  Given that Germany has been united for three decades, the housing stock in the two regions has likely become more similar. This makes the classification harder and the data set we have is not as well suited to the problem. Given this fact the error rates our model found are actually pretty good. Future research should build on this by building a classification model on a more complete data set with a wider range of variables. Researchers could also try different models on larger data sets if they have more computing capacity.
+
+
+	
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
